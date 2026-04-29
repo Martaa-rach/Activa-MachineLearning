@@ -94,6 +94,14 @@ def preprocess_and_predict(raw_input: dict) -> float:
     result = model.predict(df)[0]
     return round(float(result), 2)
 
+def get_category(score: float) -> str:
+    if score < 40:
+        return 'rendah'
+    elif score < 70:
+        return 'sedang'
+    else:
+        return 'tinggi'
+
 
 # ============================================================
 # ROUTES
@@ -101,12 +109,32 @@ def preprocess_and_predict(raw_input: dict) -> float:
 @app.route('/predict', methods=['POST'])
 def predict():
     try:
-        data  = request.get_json()
-        hasil = preprocess_and_predict(data)  # ← cukup panggil fungsi ini
+        data = request.get_json()
+
+        # Hapus field yang tidak dikenal model (dikirim Laravel tapi tidak dipakai)
+        fields_to_remove = [
+            'questionnaire_id',
+            'date_of_birth',
+            'study_minutes',
+            'physical_activity_days',
+            'sleep_hours',
+            'sleep_quality',
+            'depression_score',
+            'stress_level',
+            'happiness_score',
+        ]
+        for field in fields_to_remove:
+            data.pop(field, None)
+
+        hasil = preprocess_and_predict(data)
+
         return jsonify({
-            'digital_dependence_score': hasil,
-            'status': 'ok'
+            'digital_dependence_score' : hasil,
+            'category'                 : get_category(hasil),  # ✅ tambah
+            'confidence'               : 1.0,                  # ✅ tambah
+            'status'                   : 'ok'
         })
+
     except ValueError as ve:
         return jsonify({'error': str(ve), 'status': 'error'}), 422
     except Exception as e:
