@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify
 import pickle
 import numpy as np
 import pandas as pd
+import json
 
 app = Flask(__name__)
 
@@ -110,6 +111,19 @@ def get_category(score: float) -> str:
 def predict():
     try:
         data = request.get_json()
+
+        # ── Fix device_type: "Web" tidak dikenal model ──
+        device_type_map = {
+            'web': 'Laptop',
+            'android': 'Android',
+            'iphone': 'iPhone',
+            'tablet': 'Tablet',
+        }
+        if 'device_type' in data:
+            data['device_type'] = device_type_map.get(
+                str(data['device_type']).strip().lower(),
+                'Laptop'  # default fallback
+            )
 
         # Hapus field yang tidak dikenal model (dikirim Laravel tapi tidak dipakai)
         fields_to_remove = [
