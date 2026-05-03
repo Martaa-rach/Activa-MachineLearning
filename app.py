@@ -2,12 +2,11 @@ from flask import Flask, request, jsonify
 import pickle
 import numpy as np
 import pandas as pd
-import json
 
 app = Flask(__name__)
 
 # ============================================================
-# LOAD MODEL — dijalankan SEKALI saat Flask start
+# LOAD MODEL
 # ============================================================
 with open('digital_dependence_model.pkl', 'rb') as f:
     pkg = pickle.load(f)
@@ -16,8 +15,8 @@ model              = pkg['model']
 scaler             = pkg['scaler']
 ohe                = pkg['ohe']
 ord_enc            = pkg['ord_enc']
-log_cols           = pkg['log_cols']            # ['notifications_per_day', 'device_hours_per_day']
-sqrt_cols          = pkg['sqrt_cols']           # ['social_media_mins', 'anxiety_score', 'phone_unlocks']
+log_cols           = pkg['log_cols']
+sqrt_cols          = pkg['sqrt_cols']
 winsor_bounds      = pkg['winsor_bounds']
 num_scale_cols     = pkg['num_scale_cols']
 feature_names      = pkg['feature_names']
@@ -32,7 +31,7 @@ ORD_CATEGORIES = {col: list(cats) for col, cats in zip(ORD_COLS, ord_enc.categor
 
 
 # ============================================================
-# HELPER — normalisasi string dari user (case-insensitive)
+# HELPER — normalisasi string
 # ============================================================
 def normalize_input(value: str, valid_categories: list) -> str:
     if value in valid_categories:
@@ -45,17 +44,21 @@ def normalize_input(value: str, valid_categories: list) -> str:
 
 
 # ============================================================
-# HELPER — preprocessing + prediksi  ← TARUH DI SINI
+# HELPER — preprocessing + prediksi
 # ============================================================
 def preprocess_and_predict(raw_input: dict) -> float:
     df = pd.DataFrame([raw_input])
+    print("=== KOLOM DF ===", df.columns.tolist())
 
     # 1. Normalisasi string kategorikal
     for col in OHE_COLS:
         if col in df.columns:
+            print(f"Normalize OHE [{col}]:", df[col].tolist())
             df[col] = df[col].apply(lambda v: normalize_input(str(v), OHE_CATEGORIES[col]))
+
     for col in ORD_COLS:
         if col in df.columns:
+            print(f"Normalize ORD [{col}]:", df[col].tolist())
             df[col] = df[col].apply(lambda v: normalize_input(str(v), ORD_CATEGORIES[col]))
 
     # 2. Ordinal Encoding
@@ -71,7 +74,7 @@ def preprocess_and_predict(raw_input: dict) -> float:
         if col in df.columns:
             df[col] = df[col].clip(lo, hi)
 
-    # 5. Transform log1p dan sqrt — KUNCI AGAR TIDAK MELEDAK
+    # 5. Transform log1p dan sqrt
     for col in log_cols:
         if col in df.columns:
             df[col] = np.log1p(df[col])
@@ -82,9 +85,11 @@ def preprocess_and_predict(raw_input: dict) -> float:
     # 6. Drop kolom multikolinear & tidak signifikan
     df = df.drop(columns=drop_multicolinear + drop_insig, errors='ignore')
 
-    # 7. Pastikan semua kolom ada & urutkan sesuai training
+    # 7. Pastikan semua kolom ada & urutkan
+    print("=== KOLOM SEBELUM REORDER ===", df.columns.tolist())
     for col in feature_names:
         if col not in df.columns:
+            print(f"KOLOM HILANG, set 0: {col}")
             df[col] = 0
     df = df[feature_names]
 
@@ -92,8 +97,10 @@ def preprocess_and_predict(raw_input: dict) -> float:
     df[num_scale_cols] = scaler.transform(df[num_scale_cols])
 
     # 9. Predict
+    print("=== FINAL FEATURES ===", df.to_dict())
     result = model.predict(df)[0]
     return round(float(result), 2)
+
 
 def get_category(score: float) -> str:
     if score < 40:
@@ -111,8 +118,16 @@ def get_category(score: float) -> str:
 def predict():
     try:
         data = request.get_json()
+        print("=== DATA MASUK ===", data)
 
-        # ── Fix device_type: "Web" tidak dikenal model ──
+        # ── Default field kategorikal ──
+        data.setdefault('gender', 'Male')
+        data.setdefault('region', 'Asia')
+        data.setdefault('income_level', 'Upper-Mid')
+        data.setdefault('education_level', 'Bachelor')
+        data.setdefault('daily_role', 'Student')
+
+        # ── Fix device_type ──
         device_type_map = {
             'web': 'Laptop',
             'android': 'Android',
@@ -122,34 +137,59 @@ def predict():
         if 'device_type' in data:
             data['device_type'] = device_type_map.get(
                 str(data['device_type']).strip().lower(),
-                'Laptop'  # default fallback
+                'Laptop'
             )
 
-        # Hapus field yang tidak dikenal model (dikirim Laravel tapi tidak dipakai)
+        # ── Fix gender (kapitalisasi) ──
+        gender_map = {'male': 'Male', 'female': 'Female'}
+        if 'gender' in data:
+            data['gender'] = gender_map.get(
+                str(data['gender']).strip().lower(), 'Male'
+            )
+
+        # ── Fix education_level ──
+        education_map = {
+            'high school': 'High School',
+            'sma':         'High School',
+            'diploma':     'Bachelor',
+            'd3':          'Bachelor',
+            'd4':          'Bachelor',
+            'bachelor':    'Bachelor',
+            's1':          'Bachelor',
+            'master':      'Master',
+            's2':          'Master',
+            'phd':         'PhD',
+            's3':          'PhD',
+        }
+        if 'education_level' in data:
+            data['education_level'] = education_map.get(
+                str(data['education_level']).strip().lower(), 'Bachelor'
+            )
+
+        # ── Hapus field yang tidak dipakai model ──
         fields_to_remove = [
             'questionnaire_id',
             'date_of_birth',
+            'age',
             'study_minutes',
             'physical_activity_days',
-            'sleep_hours',
-            'sleep_quality',
-            'depression_score',
-            'stress_level',
-            'happiness_score',
         ]
         for field in fields_to_remove:
             data.pop(field, None)
 
+        print("=== DATA FINAL ===", data)
+
         hasil = preprocess_and_predict(data)
 
         return jsonify({
-            'digital_dependence_score' : hasil,
-            'category'                 : get_category(hasil),  # ✅ tambah
-            'confidence'               : 1.0,                  # ✅ tambah
-            'status'                   : 'ok'
+            'digital_dependence_score': hasil,
+            'category':                get_category(hasil),
+            'confidence':              1.0,
+            'status':                  'ok',
         })
 
     except ValueError as ve:
+        print("=== VALUE ERROR ===", str(ve))
         return jsonify({'error': str(ve), 'status': 'error'}), 422
     except Exception as e:
         import traceback; traceback.print_exc()
