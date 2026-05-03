@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify
 import pickle
 import numpy as np
 import pandas as pd
+from scipy.spatial.distance import mahalanobis
 
 app = Flask(__name__)
 
@@ -29,6 +30,90 @@ ORD_COLS = ['education_level', 'daily_role']
 OHE_CATEGORIES = {col: list(cats) for col, cats in zip(OHE_COLS, ohe.categories_)}
 ORD_CATEGORIES = {col: list(cats) for col, cats in zip(ORD_COLS, ord_enc.categories_)}
 
+# ============================================================
+# CONFIDENCE SETUP
+# Setelah StandardScaler, distribusi fitur ≈ mean=0, std=1
+# Sehingga: mean vektor = [0, 0, ...], cov = identity matrix
+# ============================================================
+SCORE_MIN = 0.0
+SCORE_MAX = 100.0
+
+_feature_mean    = np.zeros(len(feature_names))
+_feature_cov_inv = np.eye(len(feature_names))  # inverse of identity = identity
+
+
+# ============================================================
+# CONFIDENCE FUNCTIONS
+# ============================================================
+def confidence_by_score(score: float) -> dict:
+    """
+    Confidence berbasis posisi score dalam range 0–100.
+    Score mendekati ekstrem (0 atau 100) → confidence turun.
+    Range output: 60–100%.
+    """
+    score_clipped  = float(np.clip(score, SCORE_MIN, SCORE_MAX))
+    midpoint       = (SCORE_MIN + SCORE_MAX) / 2  # 50.0
+    distance_ratio = abs(score_clipped - midpoint) / midpoint  # 0.0–1.0
+    confidence     = 1.0 - (distance_ratio * 0.4)  # turun maks 40%
+    confidence_pct = round(float(np.clip(confidence, 0.6, 1.0)) * 100, 2)
+
+    if score_clipped <= 25:
+        label = 'Rendah'
+    elif score_clipped <= 50:
+        label = 'Sedang'
+    elif score_clipped <= 75:
+        label = 'Tinggi'
+    else:
+        label = 'Sangat Tinggi'
+
+    return {'confidence_pct': confidence_pct, 'label': label}
+
+
+def confidence_by_distance(X_scaled: np.ndarray) -> dict:
+    """
+    Confidence berbasis Mahalanobis distance dari distribusi training.
+    Input jauh dari distribusi → confidence turun.
+    """
+    dist           = mahalanobis(X_scaled[0], _feature_mean, _feature_cov_inv)
+    confidence     = 1.0 / (1.0 + (dist / 3.0))
+    confidence_pct = round(float(np.clip(confidence, 0.0, 1.0)) * 100, 2)
+
+    if dist <= 1.0:
+        zone = 'Dalam distribusi normal'
+    elif dist <= 2.0:
+        zone = 'Agak di luar distribusi'
+    elif dist <= 3.0:
+        zone = 'Jauh dari distribusi'
+    else:
+        zone = 'Outlier — prediksi kurang andal'
+
+    return {
+        'confidence_pct'       : confidence_pct,
+        'mahalanobis_distance' : round(float(dist), 4),
+        'zone'                 : zone,
+    }
+
+
+def get_combined_confidence(score: float, X_scaled: np.ndarray) -> dict:
+    """
+    Gabungkan kedua pendekatan dengan bobot 50:50.
+    """
+    conf_score = confidence_by_score(score)
+    conf_dist  = confidence_by_distance(X_scaled)
+
+    combined = round(
+        0.5 * conf_score['confidence_pct'] +
+        0.5 * conf_dist['confidence_pct'],
+        2
+    )
+
+    return {
+        'confidence_final_pct'    : combined,
+        'label'                   : conf_score['label'],
+        'confidence_by_score_pct' : conf_score['confidence_pct'],
+        'confidence_by_distance'  : conf_dist,
+    }
+
 
 # ============================================================
 # HELPER — normalisasi string
@@ -46,19 +131,21 @@ def normalize_input(value: str, valid_categories: list) -> str:
 # ============================================================
 # HELPER — preprocessing + prediksi
 # ============================================================
-def preprocess_and_predict(raw_input: dict) -> float:
+def preprocess_and_predict(raw_input: dict):
+    """
+    Returns tuple: (score: float, X_scaled: np.ndarray)
+    X_scaled dibutuhkan untuk menghitung Mahalanobis distance.
+    """
     df = pd.DataFrame([raw_input])
     print("=== KOLOM DF ===", df.columns.tolist())
 
     # 1. Normalisasi string kategorikal
     for col in OHE_COLS:
         if col in df.columns:
-            print(f"Normalize OHE [{col}]:", df[col].tolist())
             df[col] = df[col].apply(lambda v: normalize_input(str(v), OHE_CATEGORIES[col]))
 
     for col in ORD_COLS:
         if col in df.columns:
-            print(f"Normalize ORD [{col}]:", df[col].tolist())
             df[col] = df[col].apply(lambda v: normalize_input(str(v), ORD_CATEGORIES[col]))
 
     # 2. Ordinal Encoding
@@ -86,7 +173,6 @@ def preprocess_and_predict(raw_input: dict) -> float:
     df = df.drop(columns=drop_multicolinear + drop_insig, errors='ignore')
 
     # 7. Pastikan semua kolom ada & urutkan
-    print("=== KOLOM SEBELUM REORDER ===", df.columns.tolist())
     for col in feature_names:
         if col not in df.columns:
             print(f"KOLOM HILANG, set 0: {col}")
@@ -96,10 +182,11 @@ def preprocess_and_predict(raw_input: dict) -> float:
     # 8. StandardScaler
     df[num_scale_cols] = scaler.transform(df[num_scale_cols])
 
-    # 9. Predict
-    print("=== FINAL FEATURES ===", df.to_dict())
-    result = model.predict(df)[0]
-    return round(float(result), 2)
+    # 9. Simpan X_scaled untuk confidence, lalu predict
+    X_scaled = df[feature_names].values
+    score    = round(float(model.predict(df)[0]), 2)
+
+    return score, X_scaled
 
 
 def get_category(score: float) -> str:
@@ -129,18 +216,17 @@ def predict():
 
         # ── Fix device_type ──
         device_type_map = {
-            'web': 'Laptop',
+            'web'    : 'Laptop',
             'android': 'Android',
-            'iphone': 'iPhone',
-            'tablet': 'Tablet',
+            'iphone' : 'iPhone',
+            'tablet' : 'Tablet',
         }
         if 'device_type' in data:
             data['device_type'] = device_type_map.get(
-                str(data['device_type']).strip().lower(),
-                'Laptop'
+                str(data['device_type']).strip().lower(), 'Laptop'
             )
 
-        # ── Fix gender (kapitalisasi) ──
+        # ── Fix gender ──
         gender_map = {'male': 'Male', 'female': 'Female'}
         if 'gender' in data:
             data['gender'] = gender_map.get(
@@ -150,16 +236,16 @@ def predict():
         # ── Fix education_level ──
         education_map = {
             'high school': 'High School',
-            'sma':         'High School',
-            'diploma':     'Bachelor',
-            'd3':          'Bachelor',
-            'd4':          'Bachelor',
-            'bachelor':    'Bachelor',
-            's1':          'Bachelor',
-            'master':      'Master',
-            's2':          'Master',
-            'phd':         'PhD',
-            's3':          'PhD',
+            'sma'        : 'High School',
+            'diploma'    : 'Bachelor',
+            'd3'         : 'Bachelor',
+            'd4'         : 'Bachelor',
+            'bachelor'   : 'Bachelor',
+            's1'         : 'Bachelor',
+            'master'     : 'Master',
+            's2'         : 'Master',
+            'phd'        : 'PhD',
+            's3'         : 'PhD',
         }
         if 'education_level' in data:
             data['education_level'] = education_map.get(
@@ -167,25 +253,23 @@ def predict():
             )
 
         # ── Hapus field yang tidak dipakai model ──
-        fields_to_remove = [
-            'questionnaire_id',
-            'date_of_birth',
-            'age',
-            'study_minutes',
-            'physical_activity_days',
-        ]
-        for field in fields_to_remove:
+        for field in ['questionnaire_id', 'date_of_birth', 'age',
+                      'study_minutes', 'physical_activity_days']:
             data.pop(field, None)
 
         print("=== DATA FINAL ===", data)
 
-        hasil = preprocess_and_predict(data)
+        # ── Preprocess & Predict ──
+        score, X_scaled = preprocess_and_predict(data)
+
+        # ── Hitung Confidence ──
+        confidence = get_combined_confidence(score, X_scaled)
 
         return jsonify({
-            'digital_dependence_score': hasil,
-            'category':                get_category(hasil),
-            'confidence':              1.0,
-            'status':                  'ok',
+            'digital_dependence_score' : score,
+            'category'                 : get_category(score),
+            'confidence'               : confidence,   # ✅ sekarang object
+            'status'                   : 'ok',
         })
 
     except ValueError as ve:
