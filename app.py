@@ -2,6 +2,8 @@ from flask import Flask, request, jsonify
 import pickle
 import numpy as np
 import pandas as pd
+import requests
+import os
 from scipy.spatial.distance import mahalanobis
 
 app = Flask(__name__)
@@ -190,13 +192,49 @@ def preprocess_and_predict(raw_input: dict):
 
 
 def get_category(score: float) -> str:
-    if score < 40:
+    if score < 33.47:
         return 'rendah'
-    elif score < 70:
+    elif score < 61.34:
         return 'sedang'
     else:
         return 'tinggi'
 
+
+
+# ============================================================
+# RULE — tentukan penyebab dari SHAP + raw input
+# ============================================================
+def apply_rules(raw_data: dict) -> list:
+    penyebab = []
+
+    if raw_data.get("device_hours_per_day", 0) >= 9.15:
+        penyebab.append("screen_time_high")
+
+    if raw_data.get("notifications_per_day", 0) >= 434:
+        penyebab.append("notification_overload")
+
+    if raw_data.get("sleep_hours", 0) < 6.41:
+        penyebab.append("sleep_low")
+
+    if raw_data.get("sleep_quality", 0) <= 1.92:
+        penyebab.append("sleep_bad_quality")
+
+    if raw_data.get("anxiety_score", 0) >= 8.85:
+        penyebab.append("anxiety_high")
+
+    if raw_data.get("depression_score", 0) >= 13:
+        penyebab.append("depression_high")
+
+    if raw_data.get("stress_level", 0) >= 8.79:
+        penyebab.append("stress_high")
+
+    if raw_data.get("happiness_score", 0) <= 4:
+        penyebab.append("happiness_low")
+
+    if not penyebab:
+        penyebab.append("general")
+
+    return penyebab
 
 # ============================================================
 # ROUTES
@@ -265,11 +303,43 @@ def predict():
         # ── Hitung Confidence ──
         confidence = get_combined_confidence(score, X_scaled)
 
+        # ── RULE → penyebab ──
+        penyebab = apply_rules(data)
+        print("PENYEBAB:", penyebab)
+
+        # ── Kirim ke Node.js AI ──
+        node_payload = {
+            "score"    : score,
+            "category" : get_category(score),
+            "penyebab" : penyebab,   # hasil SHAP + RULE
+            "data"     : data        # raw input untuk konteks AI
+        }
+
+        NODE_URL = os.getenv("NODE_CHATBOT_URL", "http://localhost:3000")
+
+        try:
+            ai_resp   = requests.post(f"{NODE_URL}/chatbot", json=node_payload, timeout=30)
+            ai_result = ai_resp.json()
+        except Exception as e:
+            ai_result = {"error": f"Node.js tidak merespons: {str(e)}"}
+
+        # ── Susun ai_analysis dari hasil Node.js ──
+        ai_data = ai_result.get("ai", {})
+        ai_analysis = {
+            "penyebab"     : ai_data.get("penyebab", penyebab),
+            "pembukaan"    : ai_data.get("pembukaan", ""),
+            "rekomendasi"  : ai_data.get("rekomendasi", []),
+            "generated_at" : __import__("datetime").datetime.utcnow().isoformat() + "Z",
+        }
+
+        # ── Return ke Laravel → Flutter ──
         return jsonify({
-            'digital_dependence_score' : score,
-            'category'                 : get_category(score),
-            'confidence'               : confidence,   # ✅ sekarang object
-            'status'                   : 'ok',
+            "digital_dependence_score" : score,
+            "category"                 : get_category(score),
+            "confidence"               : confidence,
+            "high_risk_flag"           : 1 if score >= 70 else 0,
+            "ai_analysis"              : ai_analysis,
+            "status"                   : "ok",
         })
 
     except ValueError as ve:
